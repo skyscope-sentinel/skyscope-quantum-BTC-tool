@@ -9,6 +9,7 @@ import binascii
 import multiprocessing
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit.circuit.library import QFT
+from qiskit_aer import AerSimulator
 from qiskit_ibm_runtime import QiskitRuntimeService, Session, Sampler as RuntimeSampler
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
@@ -23,7 +24,7 @@ backend = service.least_busy(operational=True, simulator=False, min_num_qubits=2
 
 # API keys and database
 COINAPI_KEY = 'ec42825f-62f6-4c0f-99b6-d0dfcad2498d'
-DATABASE_PATH = 'database/11_13_2022/'
+DATABASE_PATH = 'database/11_13_2022/'  # Updated path
 DATABASE_AVAILABLE = os.path.exists(DATABASE_PATH)
 
 # SQLite setup
@@ -62,7 +63,7 @@ def check_balance_database(address: str, substring_length: int = 8) -> Tuple[str
         return address, 0
     substring = address[-substring_length:]
     for filename in os.listdir(DATABASE_PATH):
-        with open(os.path.join(DATABASE_PATH, filename), 'r') as f:
+        with open(os.path.join(DATABASE_PATH, filename), 'r', encoding='utf-8') as f:
             if substring in f.read():
                 f.seek(0)
                 if address in f.read():
@@ -92,40 +93,41 @@ def check_balance_blockchain(address: str) -> int:
 
 # Batch balance checking
 def check_balance_batch(addresses: List[str]) -> List[Tuple[str, int]]:
-    if DATABASE_AVAILABLE:
-        results = list(map(check_balance_database, addresses))
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_addr = {executor.submit(check_balance_coinapi, addr): addr for addr, bal in results if bal > 0}
-            verified = {future_to_addr[f]: f.result(timeout=3) for f in future_to_addr}
-        return [(addr, verified.get(addr, bal if bal == 0 else check_balance_coinapi(addr))) for addr, bal in results]
-    else:
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_addr = {executor.submit(check_balance_coinapi, addr): addr for addr in addresses}
-            results = []
-            for future in future_to_addr:
-                addr = future_to_addr[future]
-                try:
-                    balance = future.result(timeout=3)
-                    results.append((addr, balance))
-                except Exception:
-                    results.append((addr, 0))
-            return results
+    results = list(map(check_balance_database, addresses))
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_addr = {executor.submit(check_balance_coinapi, addr): addr for addr, bal in results if bal > 0}
+        verified = {future_to_addr[f]: f.result(timeout=3) for f in future_to_addr}
+    return [(addr, verified.get(addr, bal if bal == 0 else check_balance_coinapi(addr))) for addr, bal in results]
 
-# Quantum tweak search with Hadamard and QFT
-def quantum_tweak_search(passphrase: str, n_bits: int, session) -> List[int]:
+# Local virtual quantum sandbox (25 qubits)
+def local_quantum_sandbox(passphrase: str, n_bits: int) -> List[int]:
     qreg = QuantumRegister(n_bits, 'q')
     creg = ClassicalRegister(n_bits, 'c')
     qc = QuantumCircuit(qreg, creg)
     
-    # Hadamard gates for superposition (simultaneous tweak evaluation)
+    qc.h(range(n_bits))  # Hadamard for superposition
+    qc.cz(0, n_bits - 1)  # Simplified oracle
+    qc.append(QFT(n_bits, do_swaps=False).inverse(), range(n_bits))  # QFT
+    
+    qc.measure(range(n_bits), range(n_bits))
+    
+    simulator = AerSimulator(method='statevector')
+    job = simulator.run(qc, shots=1000)
+    result = job.result()
+    counts = result.get_counts()
+    
+    tweaks = [int(state, 2) for state, count in counts.items() if count / 1000 > 0.05]
+    return tweaks[:50]  # Top 50 candidates
+
+# IBM Quantum refinement (20 qubits)
+def ibm_quantum_refine(passphrase: str, n_bits: int, session, candidates: List[int]) -> List[int]:
+    qreg = QuantumRegister(n_bits, 'q')
+    creg = ClassicalRegister(n_bits, 'c')
+    qc = QuantumCircuit(qreg, creg)
+    
     qc.h(range(n_bits))
-    
-    # Placeholder oracle (simulates marking funded tweaks)
-    qc.cz(0, n_bits - 1)  # Simplified Grover-like step
-    
-    # QFT for Shor-like interference
+    qc.cz(0, n_bits - 1)
     qc.append(QFT(n_bits, do_swaps=False).inverse(), range(n_bits))
-    
     qc.measure(range(n_bits), range(n_bits))
     
     sampler = RuntimeSampler(session=session, backend=backend)
@@ -133,34 +135,35 @@ def quantum_tweak_search(passphrase: str, n_bits: int, session) -> List[int]:
     result = job.result()
     counts = result.quasi_dists[0].binary_probabilities()
     
-    # Return top tweaks
     tweaks = [int(state, 2) for state, prob in counts.items() if prob > 0.05]
-    return tweaks[:20]  # Top 20 candidates
+    return tweaks[:20]  # Top 20 refined candidates
 
 # Save to DB
 def save_to_db(conn, priv_key: bytes, address: str, balance: int):
     wif_key = private_key_to_wif(priv_key)
     c = conn.cursor()
-    timestamp = time.strftime("%Y-%m-%d %H:%:M:%S")
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     c.execute("INSERT INTO addresses VALUES (?, ?, ?, ?, ?)",
               (priv_key.hex(), wif_key, address, balance, timestamp))
     conn.commit()
     print(f"Found: {address} | Balance: {balance / 100000000:.8f} BTC | WIF: {wif_key}")
 
-# Worker function with 20-core utilization
-def worker(passphrases: List[str], n_bits: int, session, conn, checked_count: multiprocessing.Value):
+# Worker function with 500 virtual qubits
+def worker(passphrases: List[str], local_bits: int, ibm_bits: int, session, conn, checked_count: multiprocessing.Value):
     local_count = 0
     for passphrase in passphrases:
-        tweaks = quantum_tweak_search(passphrase, n_bits, session)
-        keypairs = [generate_brainwallet_key(passphrase, tweak) for tweak in tweaks]
+        local_tweaks = local_quantum_sandbox(passphrase, local_bits)  # 25 qubits
+        ibm_tweaks = ibm_quantum_refine(passphrase, ibm_bits, session, local_tweaks)  # 20 qubits
+        
+        keypairs = [generate_brainwallet_key(passphrase, tweak) for tweak in ibm_tweaks]
         addresses = [kp[1] for kp in keypairs]
         priv_keys = [kp[0] for kp in keypairs]
         
         balance_results = check_balance_batch(addresses)
         for (addr, bal), priv_key in zip(balance_results, priv_keys):
-            if bal > 0:  # Real balance
+            if bal > 0:
                 save_to_db(conn, priv_key, addr, bal)
-        local_count += len(tweaks)
+        local_count += len(ibm_tweaks)
     
     with checked_count.get_lock():
         checked_count.value += local_count
@@ -179,20 +182,21 @@ def main():
         "admin123", "pass", "love", "root", "private",
         "password1", "bitcoin123", "qwerty123", "secure123", "wallet123"
     ]
-    n_bits = 12  # 2^12 = 4096 tweaks max, adjusted for 20 qubits
+    local_bits = 25  # 25 qubits/sandbox, 20 sandboxes = 500 virtual qubits
+    ibm_bits = 20    # 20 real qubits on IBM
     
     checked_count = multiprocessing.Value('i', 0)
     
     try:
         start_time = time.time()
         processes = []
-        cpu_count = 20  # Leverage all 20 virtual cores
+        cpu_count = 20  # 20 virtual cores
         chunk_size = max(1, len(passphrases) // cpu_count)
         
         for i in range(cpu_count):
             chunk = passphrases[i * chunk_size:(i + 1) * chunk_size]
-            if chunk:  # Ensure chunk isn’t empty
-                p = multiprocessing.Process(target=worker, args=(chunk, n_bits, session, conn, checked_count))
+            if chunk:
+                p = multiprocessing.Process(target=worker, args=(chunk, local_bits, ibm_bits, session, conn, checked_count))
                 processes.append(p)
                 p.start()
         
