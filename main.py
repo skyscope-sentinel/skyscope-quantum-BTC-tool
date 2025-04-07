@@ -10,7 +10,7 @@ import multiprocessing
 from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit.circuit.library import QFT
 from qiskit_aer import AerSimulator
-from qiskit_ibm_runtime import QiskitRuntimeService, Session, Sampler as RuntimeSampler
+from qiskit_ibm_runtime import QiskitRuntimeService, Sampler
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
 
@@ -24,7 +24,7 @@ backend = service.least_busy(operational=True, simulator=False, min_num_qubits=2
 
 # API keys and database
 COINAPI_KEY = 'ec42825f-62f6-4c0f-99b6-d0dfcad2498d'
-DATABASE_PATH = 'database/11_13_2022/'  # Updated path
+DATABASE_PATH = 'database/11_13_2022/'
 DATABASE_AVAILABLE = os.path.exists(DATABASE_PATH)
 
 # SQLite setup
@@ -120,7 +120,7 @@ def local_quantum_sandbox(passphrase: str, n_bits: int) -> List[int]:
     return tweaks[:50]  # Top 50 candidates
 
 # IBM Quantum refinement (20 qubits)
-def ibm_quantum_refine(passphrase: str, n_bits: int, session, candidates: List[int]) -> List[int]:
+def ibm_quantum_refine(passphrase: str, n_bits: int, candidates: List[int]) -> List[int]:
     qreg = QuantumRegister(n_bits, 'q')
     creg = ClassicalRegister(n_bits, 'c')
     qc = QuantumCircuit(qreg, creg)
@@ -130,7 +130,7 @@ def ibm_quantum_refine(passphrase: str, n_bits: int, session, candidates: List[i
     qc.append(QFT(n_bits, do_swaps=False).inverse(), range(n_bits))
     qc.measure(range(n_bits), range(n_bits))
     
-    sampler = RuntimeSampler(session=session, backend=backend)
+    sampler = Sampler(backend=backend)
     job = sampler.run(qc, shots=1000)
     result = job.result()
     counts = result.quasi_dists[0].binary_probabilities()
@@ -149,11 +149,11 @@ def save_to_db(conn, priv_key: bytes, address: str, balance: int):
     print(f"Found: {address} | Balance: {balance / 100000000:.8f} BTC | WIF: {wif_key}")
 
 # Worker function with 500 virtual qubits
-def worker(passphrases: List[str], local_bits: int, ibm_bits: int, session, conn, checked_count: multiprocessing.Value):
+def worker(passphrases: List[str], local_bits: int, ibm_bits: int, conn, checked_count: multiprocessing.Value):
     local_count = 0
     for passphrase in passphrases:
         local_tweaks = local_quantum_sandbox(passphrase, local_bits)  # 25 qubits
-        ibm_tweaks = ibm_quantum_refine(passphrase, ibm_bits, session, local_tweaks)  # 20 qubits
+        ibm_tweaks = ibm_quantum_refine(passphrase, ibm_bits, local_tweaks)  # 20 qubits
         
         keypairs = [generate_brainwallet_key(passphrase, tweak) for tweak in ibm_tweaks]
         addresses = [kp[1] for kp in keypairs]
@@ -171,7 +171,6 @@ def worker(passphrases: List[str], local_bits: int, ibm_bits: int, session, conn
 # Main loop
 def main():
     conn = init_db()
-    session = Session(service=service, backend=backend)
     
     passphrases = [
         "password", "bitcoin", "123456", "secret", "letmein",
@@ -196,7 +195,7 @@ def main():
         for i in range(cpu_count):
             chunk = passphrases[i * chunk_size:(i + 1) * chunk_size]
             if chunk:
-                p = multiprocessing.Process(target=worker, args=(chunk, local_bits, ibm_bits, session, conn, checked_count))
+                p = multiprocessing.Process(target=worker, args=(chunk, local_bits, ibm_bits, conn, checked_count))
                 processes.append(p)
                 p.start()
         
@@ -217,7 +216,6 @@ def main():
     finally:
         for p in processes:
             p.join()
-        session.close()
         conn.close()
 
 if __name__ == "__main__":
