@@ -1,0 +1,5 @@
+{
+    "bybit_api_key": null,
+    "bybit_api_secret": null,
+    "ollama_model_endpoint": "http://localhost:11434"
+}

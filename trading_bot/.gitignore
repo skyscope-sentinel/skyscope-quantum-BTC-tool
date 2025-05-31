@@ -1,0 +1,5 @@
+config.json # API keys and sensitive data
+*.pyc
+__pycache__/
+.env # Alternative for environment variables
+# Add other necessary ignores
