@@ -10,13 +10,15 @@ from decimal import Decimal
 # The number of bins per feature will determine the size of the Q-table.
 # Example: obs = [p1, p2, p3, p4, p5, usdt_bal_norm, base_bal_norm]
 # Price features are normalized around 0 (e.g. -0.1 to 0.1 perhaps)
-# Balance features are normalized 0 to 1.
+# Balance features are normalized 0 to 1 (or higher if portfolio grows).
 
 # Define discretization bins more carefully
 # Prices are (price/mean_price_in_window) - 1. So range could be e.g. -0.2 to 0.2
 PRICE_BINS = np.linspace(-0.3, 0.3, num=5) # 5 bins for each price point in window (e.g. very low, low, mid, high, very high relative to mean)
-USDT_BALANCE_BINS = np.linspace(0, 1, num=5) # 5 bins for USDT balance %
-BASE_BALANCE_BINS = np.linspace(0, 1, num=5) # 5 bins for Base currency balance % (relative to max possible)
+# Normalized balances can exceed 1.0 if the portfolio value grows.
+# Extending bins to 1.5 allows capturing states of moderate growth.
+USDT_BALANCE_BINS = np.linspace(0, 1.5, num=5) # 5 bins for USDT balance %
+BASE_BALANCE_BINS = np.linspace(0, 1.5, num=5) # 5 bins for Base currency balance % (relative to max possible)
 
 def discretize_state(observation, window_size):
     """
