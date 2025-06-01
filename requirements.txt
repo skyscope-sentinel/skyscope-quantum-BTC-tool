@@ -1,6 +1,4 @@
 pybit
 requests
-qiskit
-qiskit-aer
 numpy
 matplotlib

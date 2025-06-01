@@ -101,8 +101,14 @@ def save_portfolio_state(state):
 # --- Dummy QuantumInspiredOptimizer for now if not properly defined elsewhere ---
 # This should ideally be imported if it's in a separate file from the original plan
 class QuantumInspiredOptimizer:
-    def __init__(self, n_qubits=5, shots=100): self.n_qubits, self.shots = n_qubits, shots; logger.info("Dummy QuantumOptimizer initialized.")
-    def generate_parameters(self): logger.debug("Dummy QuantumOptimizer: No params generated."); return None
+    def __init__(self, n_qubits=5, shots=100):
+        self.n_qubits = n_qubits
+        self.shots = shots
+        logger.info("QuantumInspiredOptimizer initialized (EXPERIMENTAL/PLACEHOLDER: Not used for actual trading decisions in this version).")
+
+    def generate_parameters(self):
+        logger.info("QuantumInspiredOptimizer.generate_parameters called (EXPERIMENTAL/PLACEHOLDER: Returning None, no parameters generated).")
+        return None
 
 
 class ByBitTrader:
@@ -140,34 +146,129 @@ class ByBitTrader:
         except Exception as e: logger.error(f"Exception in get_market_price: {e}"); return None
 
     def place_market_order(self, symbol, side, qty_str, category="spot"):
-        logger.info(f"STUBBED: {side} {qty_str} {symbol} (Testnet: {self.is_testnet})")
-        return f"STUBBED_ORDER_ID_{int(time.time())}"
+        if not self.session:
+            logger.error("Bybit session not available for place_market_order.")
+            return None, "SESSION_NOT_AVAILABLE"
+
+        order_params = {
+            "category": category,
+            "symbol": symbol,
+            "side": side,  # 'Buy' or 'Sell'
+            "orderType": "Market",
+            "qty": str(qty_str),  # Ensure qty is a string
+        }
+        try:
+            logger.info(f"Placing order with params: {order_params} (Testnet: {self.is_testnet})")
+            response = self.session.place_order(**order_params)
+            logger.debug(f"Raw ByBit place_order response: {response}")
+
+            if response and response.get('retCode') == 0:
+                order_id = response.get('result', {}).get('orderId')
+                if order_id:
+                    logger.info(f"Successfully placed {side} order for {qty_str} {symbol}. Order ID: {order_id}")
+                    return order_id, str(response) # Return orderId and raw response for logging
+                else:
+                    logger.error(f"Order placement succeeded (retCode 0) but no orderId returned. Response: {response}")
+                    return None, f"LIVE_ORDER_NO_ORDER_ID_RETCODE_0: {str(response)}"
+            else:
+                ret_code = response.get('retCode') if response else 'N/A'
+                ret_msg = response.get('retMsg') if response else 'No response object'
+                logger.error(f"Failed to place order. retCode: {ret_code}, retMsg: '{ret_msg}'. Params: {order_params}")
+                return None, f"LIVE_ORDER_FAILED_API: retCode={ret_code}, retMsg='{ret_msg}', Response: {str(response)}"
+
+        except Exception as e:
+            logger.error(f"Exception during place_market_order: {e}. Params: {order_params}")
+            return None, f"LIVE_ORDER_EXCEPTION: {str(e)}"
 
 class OllamaAdvisor:
     def __init__(self, endpoint, model_name): self.endpoint, self.model_name = endpoint, model_name; logger.info(f"OllamaAdvisor init: {model_name} at {endpoint}")
-    def construct_prompt(self, market_price, balance_usdt, trading_goal, current_btc_balance=None, rp=None, qp=None):
-        # Simplified prompt construction for brevity in this combined file
-        return f"Price: {market_price}, USDT: {balance_usdt}, BTC: {current_btc_balance if current_btc_balance else '0'}, Goal: {trading_goal}. Advice?"
+    def construct_prompt(self, symbol, market_price, balance_usdt, trading_goal, current_base_balance=None, recent_prices_str="N/A", qp_summary="N/A"):
+        # Ensure balances are formatted to a reasonable number of decimal places for the prompt
+        market_price_str = f"{market_price:.2f}"
+        balance_usdt_str = f"{balance_usdt:.2f}"
+        current_base_balance_str = f"{current_base_balance:.8f}" if current_base_balance is not None else "0.0"
+        base_curr = symbol.replace("USDT", "") # Extract base currency (e.g., BTC)
+
+        prompt = (
+            f"Given the current market conditions for {symbol}: Current Price=${market_price_str} USD. "
+            f"My current portfolio: {balance_usdt_str} USDT, {current_base_balance_str} {base_curr}. "
+            f"My trading goal is: '{trading_goal}'. "
+            f"Recent relative price changes (last {RL_ENV_WINDOW_SIZE} periods, if available, normalized to mean): {recent_prices_str}. "
+            f"Optional quantum optimizer suggestion: {qp_summary}. "
+            f"Based *only* on the information provided, should I BUY, SELL, or HOLD {base_curr}? "
+            f"If BUY or SELL, what quantity of {base_curr} would you suggest? "
+            f"Respond with ONLY a JSON object in the format: "
+            f"{{\"action\": \"BUY|SELL|HOLD\", \"quantity\": \"<float_string_or_null>\", \"reasoning\": \"<brief_reasoning>\"}}."
+        )
+        return prompt
+
     def get_trading_advice(self, prompt):
+        agent_raw_response = "N/A"
         try:
             logger.debug(f"OllamaAdvisor: Getting advice for prompt (len {len(prompt)})...")
+            # logger.debug(f"Ollama Prompt: {prompt}") # Uncomment for deep debugging of prompt
+
             if "dummy_ollama" in self.endpoint: # Allow testing RL without real Ollama
                 actions = ["BUY", "SELL", "HOLD"]
                 action = actions[int(time.time()) % 3]
                 qty = Decimal("0.0001") if action == "BUY" else (Decimal("0.00005") if action == "SELL" else None)
-                return action, qty, f"Dummy Ollama: {action} {qty if qty else ''}"
+                dummy_response = {"action": action, "quantity": str(qty) if qty else None, "reasoning": "Dummy response"}
+                agent_raw_response = json.dumps(dummy_response)
+                return action, qty, agent_raw_response
 
-            payload = {"model": self.model_name, "prompt": prompt, "stream": False, "options": {"temperature": 0.3}}
-            r = requests.post(self.endpoint, json=payload, timeout=30) 
-            r.raise_for_status(); data = r.json(); adv = data.get('response','').strip()
-            parts = adv.split(); act = parts[0].upper()
-            q_s = parts[1] if len(parts) > 1 else None
-            if act in ["BUY","SELL"]:
-                if not q_s: return "HOLD",None,adv
-                try: q_d = Decimal(q_s); return (act, q_d, adv) if q_d > 0 else ("HOLD",None,adv)
-                except: return "HOLD",None,adv # Invalid quantity string
-            return ("HOLD",None,adv) if act == "HOLD" else ("HOLD",None,adv+" [Interpreted as HOLD]")
-        except Exception as e: logger.error(f"Ollama exc: {e}"); return "HOLD",None,f"ERR_OLLAMA:{e}"
+            payload = {"model": self.model_name, "prompt": prompt, "stream": False, "options": {"temperature": 0.2, "num_predict": 150}} # Added num_predict
+            r = requests.post(self.endpoint, json=payload, timeout=45)  # Increased timeout
+            r.raise_for_status()
+            data = r.json()
+            agent_raw_response = data.get('response','').strip()
+
+            logger.debug(f"Ollama raw response: {agent_raw_response}")
+
+            # Attempt to find JSON within the response if the model is verbose
+            try:
+                json_start_index = agent_raw_response.find('{')
+                json_end_index = agent_raw_response.rfind('}') + 1
+                if json_start_index != -1 and json_end_index != -1:
+                    json_str = agent_raw_response[json_start_index:json_end_index]
+                    parsed_response = json.loads(json_str)
+                else: # Fallback if no clear JSON object is found
+                    logger.warning(f"Ollama: No JSON object found in response: {agent_raw_response}")
+                    return "HOLD", None, f"ERR_OLLAMA_NO_JSON: {agent_raw_response}"
+            except json.JSONDecodeError as je:
+                logger.error(f"Ollama JSON parsing error: {je} from response: {agent_raw_response}")
+                return "HOLD", None, f"ERR_OLLAMA_JSON_DECODE: {agent_raw_response}"
+
+            action = parsed_response.get("action", "HOLD").upper()
+            quantity_str = parsed_response.get("quantity")
+
+            # Validate action
+            if action not in ["BUY", "SELL", "HOLD"]:
+                logger.warning(f"Ollama: Invalid action '{action}' received. Defaulting to HOLD.")
+                action = "HOLD"
+
+            if action == "HOLD":
+                return "HOLD", None, agent_raw_response
+
+            if quantity_str is None or quantity_str.lower() == 'null':
+                 logger.warning(f"Ollama: Action {action} received but quantity is null. Defaulting to HOLD.")
+                 return "HOLD", None, agent_raw_response
+
+            try:
+                quantity = Decimal(quantity_str)
+                if quantity <= Decimal("0"):
+                    logger.warning(f"Ollama: Action {action} with non-positive quantity {quantity}. Defaulting to HOLD.")
+                    return "HOLD", None, agent_raw_response
+                return action, quantity, agent_raw_response
+            except Exception as e:
+                logger.error(f"Ollama: Error converting quantity '{quantity_str}' to Decimal: {e}. Defaulting to HOLD.")
+                return "HOLD", None, agent_raw_response
+
+        except requests.exceptions.RequestException as re:
+            logger.error(f"Ollama request exception: {re}")
+            return "HOLD", None, f"ERR_OLLAMA_REQUEST_FAILED: {re}"
+        except Exception as e:
+            logger.error(f"Ollama general exception: {e} processing response: {agent_raw_response}")
+            return "HOLD", None, f"ERR_OLLAMA_GENERAL: {e}"
 
 
 def get_current_observation_for_rl(current_price, price_history_window, usdt_balance, base_balance, initial_usdt_balance, window_size):
@@ -221,7 +322,22 @@ def run_trading_cycle(trader, portfolio_state, cycle_id, config, agent_type='oll
 
     if agent_type == 'ollama':
         if ollama_advisor:
-            prompt = ollama_advisor.construct_prompt(current_price, usdt_bal, config.get('trading_goal',"undefined goal"), base_bal, qp=q_summary)
+            recent_prices_summary = "N/A"
+            if price_hist_for_rl and len(price_hist_for_rl) >= RL_ENV_WINDOW_SIZE:
+                # Use the same normalization idea as for RL agent, but as a string
+                # Take the most recent 'RL_ENV_WINDOW_SIZE' elements for summary
+                relevant_history = price_hist_for_rl[-(RL_ENV_WINDOW_SIZE + 1):-1] # prices leading up to current
+                if not relevant_history: relevant_history = [current_price] * RL_ENV_WINDOW_SIZE # fallback
+
+                mean_val = sum(relevant_history)/len(relevant_history) if relevant_history else Decimal('1')
+                norm_prices_for_ollama = [(p/mean_val)-Decimal('1') for p in relevant_history]
+                recent_prices_summary = ", ".join([f"{p:.4f}" for p in norm_prices_for_ollama])
+
+            prompt = ollama_advisor.construct_prompt(
+                TRADING_SYMBOL, current_price, usdt_bal,
+                config.get('trading_goal',"undefined goal"), base_bal,
+                recent_prices_str=recent_prices_summary, qp_summary=q_summary
+            )
             agent_act, agent_qty, agent_raw = ollama_advisor.get_trading_advice(prompt)
         else: logger.error("Ollama agent selected, but no advisor instance provided. Holding.")
     
@@ -253,66 +369,105 @@ def run_trading_cycle(trader, portfolio_state, cycle_id, config, agent_type='oll
     logger.info(f"Agent ({agent_type}) -> Decision: {agent_act}, Suggested Qty (Ollama): {agent_qty if agent_qty else 'N/A'}")
     
     # --- Execution based on agent's decision ---
-    final_executed_action, final_executed_qty, trade_value_usdt, order_id, status = agent_act, Decimal("0"), Decimal("0"), "N/A", "PENDING_EXECUTION"
+    final_executed_action, final_executed_qty, trade_value_usdt = agent_act, Decimal("0"), Decimal("0")
+    order_id, status, order_response_log_msg = "N/A", "PENDING_EXECUTION", "N/A"
 
     trade_percent = Decimal(config.get('default_trade_percentage', str(DEFAULT_USDT_TRADE_PERCENTAGE)))
+    # Define precision for quantity string formatting based on symbol or general use
+    # For BTCUSDT, Bybit might require up to 8 decimal places for BTC quantity.
+    # Let's use a general precision that's likely safe for BTC.
+    qty_precision = Decimal('0.00000001')
+
 
     if agent_act == "BUY":
         if usdt_bal >= MIN_USDT_ORDER_VALUE:
-            # Determine quantity based on fixed percentage of USDT for RL, or Ollama's suggestion
-            qty_to_buy = (usdt_bal * trade_percent / current_price).quantize(Decimal('0.00000001'), ROUND_DOWN)
+            qty_to_buy_calc = (usdt_bal * trade_percent / current_price)
             if agent_type == 'ollama' and agent_qty and agent_qty > 0:
-                 qty_to_buy = min(qty_to_buy, agent_qty) # Take the more conservative (smaller) of the two
+                 qty_to_buy_calc = min(qty_to_buy_calc, agent_qty)
             
+            # Ensure quantity is quantized before any other checks or string conversion
+            qty_to_buy = qty_to_buy_calc.quantize(qty_precision, ROUND_DOWN)
+
             if qty_to_buy >= MIN_BTC_ORDER_QTY:
-                val_usdt = (qty_to_buy * current_price).quantize(Decimal('0.01'), ROUND_UP) # Cost
-                if val_usdt <= usdt_bal: # Check if we can afford it
-                    final_executed_qty = qty_to_buy
-                    order_id = trader.place_market_order(TRADING_SYMBOL, "Buy", str(final_executed_qty))
-                    if order_id: status = "STUBBED_BUY_SUCCESS"; portfolio_state[QUOTE_CURRENCY] -= val_usdt; portfolio_state[BASE_CURRENCY] += final_executed_qty
-                    else: status = "STUBBED_BUY_FAILED"
+                val_usdt = (qty_to_buy * current_price).quantize(Decimal('0.01'), ROUND_UP)
+                if val_usdt <= usdt_bal:
+                    final_executed_qty_str = str(qty_to_buy) # Format to string *after* all Decimal calculations
+                    actual_order_id, order_response_log_msg = trader.place_market_order(TRADING_SYMBOL, "Buy", final_executed_qty_str)
+                    order_id = actual_order_id # For logging in log_trade_action
+                    if actual_order_id:
+                        status = "LIVE_BUY_SUCCESS"
+                        trade_value_usdt = val_usdt # Log the actual trade value
+                        final_executed_qty = qty_to_buy # Store Decimal for portfolio update
+                        portfolio_state[QUOTE_CURRENCY] -= val_usdt
+                        portfolio_state[BASE_CURRENCY] += final_executed_qty
+                    else:
+                        status = f"LIVE_BUY_FAILED ({order_response_log_msg})"
+                        final_executed_action = "HOLD" # Mark as HOLD if order failed
                 else: status = "REJECTED_BUY_AFFORDABILITY"; final_executed_action = "HOLD"
             else: status = "REJECTED_BUY_QTY_TOO_LOW"; final_executed_action = "HOLD"
         else: status = "REJECTED_BUY_LOW_USDT"; final_executed_action = "HOLD"
 
     elif agent_act == "SELL":
         if base_bal >= MIN_BTC_ORDER_QTY:
-            # Determine quantity: fixed percent of base for RL, or Ollama's suggestion (capped by available)
-            qty_to_sell = (base_bal * trade_percent).quantize(Decimal('0.00000001'), ROUND_DOWN)
+            qty_to_sell_calc = (base_bal * trade_percent)
             if agent_type == 'ollama' and agent_qty and agent_qty > 0:
-                qty_to_sell = min(qty_to_sell, agent_qty, base_bal) # Cannot sell more than available
+                qty_to_sell_calc = min(qty_to_sell_calc, agent_qty)
+
+            # Ensure quantity is quantized and also capped by available balance before other checks
+            qty_to_sell = qty_to_sell_calc.quantize(qty_precision, ROUND_DOWN)
+            qty_to_sell = min(qty_to_sell, base_bal)
+
 
             if qty_to_sell >= MIN_BTC_ORDER_QTY:
-                val_usdt = (qty_to_sell * current_price).quantize(Decimal('0.01'), ROUND_DOWN) # Proceeds
+                val_usdt = (qty_to_sell * current_price).quantize(Decimal('0.01'), ROUND_DOWN)
                 if val_usdt >= MIN_USDT_ORDER_VALUE:
-                    final_executed_qty = qty_to_sell
-                    order_id = trader.place_market_order(TRADING_SYMBOL, "Sell", str(final_executed_qty))
-                    if order_id: status = "STUBBED_SELL_SUCCESS"; portfolio_state[QUOTE_CURRENCY] += val_usdt; portfolio_state[BASE_CURRENCY] -= final_executed_qty
-                    else: status = "STUBBED_SELL_FAILED"
+                    final_executed_qty_str = str(qty_to_sell) # Format to string *after* all Decimal calculations
+                    actual_order_id, order_response_log_msg = trader.place_market_order(TRADING_SYMBOL, "Sell", final_executed_qty_str)
+                    order_id = actual_order_id # For logging
+                    if actual_order_id:
+                        status = "LIVE_SELL_SUCCESS"
+                        trade_value_usdt = val_usdt # Log the actual trade value
+                        final_executed_qty = qty_to_sell # Store Decimal for portfolio update
+                        portfolio_state[QUOTE_CURRENCY] += val_usdt
+                        portfolio_state[BASE_CURRENCY] -= final_executed_qty
+                    else:
+                        status = f"LIVE_SELL_FAILED ({order_response_log_msg})"
+                        final_executed_action = "HOLD" # Mark as HOLD if order failed
                 else: status = "REJECTED_SELL_VALUE_TOO_LOW"; final_executed_action = "HOLD"
             else: status = "REJECTED_SELL_QTY_TOO_LOW"; final_executed_action = "HOLD"
         else: status = "REJECTED_SELL_LOW_BASE"; final_executed_action = "HOLD"
     
-    if agent_act == "HOLD" or final_executed_action == "HOLD": # If original action was HOLD or it became HOLD due to rules
-        final_executed_action = "HOLD" # Ensure it's marked as HOLD
-        status = "DECIDED_HOLD" if status == "PENDING_EXECUTION" else status # Keep rejection status if applicable
-        final_executed_qty = Decimal("0") # No quantity for HOLD
-        trade_value_usdt = Decimal("0") # No value for HOLD
+    if agent_act == "HOLD" or final_executed_action == "HOLD":
+        final_executed_action = "HOLD"
+        status = "DECIDED_HOLD" if status == "PENDING_EXECUTION" else status
+        final_executed_qty = Decimal("0")
+        trade_value_usdt = Decimal("0")
+        # Ensure order_id remains "N/A" or any specific failure message if an attempt was made
+        if status not in ["LIVE_BUY_SUCCESS", "LIVE_SELL_SUCCESS"] and "FAILED" not in status and "EXCEPTION" not in status:
+             order_id = "N/A"
     
-    log_trade_action({
+    # Log the raw response from order placement if it's not a success and contains info
+    if "FAILED" in status or "EXCEPTION" in status:
+        logger.info(f"Order Response Log for failed/exception trade: {order_response_log_msg}")
+
+    log_data = {
         "timestamp": datetime.now().isoformat(), "symbol": TRADING_SYMBOL, "action": final_executed_action,
-        "price": str(current_price), "quantity_base": str(final_executed_qty), "value_quote": str(trade_value_usdt),
-        "agent_type": agent_type, "agent_raw_advice": agent_raw, "agent_action": agent_act, # Log original agent action
-        "agent_qty_suggestion": str(agent_qty) if agent_qty else "N/A",
-        "quantum_summary": q_summary, "order_id": order_id, "status": status,
-        "portfolio_usdt_before": str(pf_usdt_before.quantize(Decimal('0.01'))), 
-        "portfolio_base_before": str(pf_base_before.quantize(Decimal('0.00000001'))),
+        "price": str(current_price.quantize(Decimal('0.01'))),
+        "quantity_base": str(final_executed_qty.quantize(qty_precision)),
+        "value_quote": str(trade_value_usdt.quantize(Decimal('0.01'))),
+        "agent_type": agent_type, "agent_raw_advice": agent_raw, "agent_action": agent_act,
+        "agent_qty_suggestion": str(agent_qty.quantize(qty_precision) if agent_qty else "N/A"),
+        "quantum_summary": q_summary, "order_id": order_id if order_id else "N/A", "status": status,
+        "portfolio_usdt_before": str(pf_usdt_before.quantize(Decimal('0.01'))),
+        "portfolio_base_before": str(pf_base_before.quantize(qty_precision)),
         "portfolio_usdt_after": str(portfolio_state[QUOTE_CURRENCY].quantize(Decimal('0.01'))), 
-        "portfolio_base_after": str(portfolio_state[BASE_CURRENCY].quantize(Decimal('0.00000001'))),
+        "portfolio_base_after": str(portfolio_state[BASE_CURRENCY].quantize(qty_precision)), # Corrected precision here
         "cycle_id": str(cycle_id)
-    })
+    }
+    log_trade_action(log_data) # Pass the prepared dictionary
+
     save_portfolio_state(portfolio_state)
-    logger.info(f"End Cycle {cycle_id}: Executed: {final_executed_action}, Qty: {final_executed_qty}, Status: {status}. Portfolio: {portfolio_state[QUOTE_CURRENCY]:.2f} {QUOTE_CURRENCY}, {portfolio_state[BASE_CURRENCY]:.8f} {BASE_CURRENCY}")
+    logger.info(f"End Cycle {cycle_id}: Executed: {final_executed_action}, Qty: {final_executed_qty.quantize(qty_precision)}, Status: {status}. Portfolio: {portfolio_state[QUOTE_CURRENCY]:.2f} {QUOTE_CURRENCY}, {portfolio_state[BASE_CURRENCY]:.8f} {BASE_CURRENCY}")
     return portfolio_state
 
 def main():
@@ -348,7 +503,7 @@ def main():
     if args.testnet is None: use_testnet = config.get('bybit_testnet', True)
     else: use_testnet = args.testnet
     config['bybit_testnet'] = use_testnet
-    if not use_testnet: logger.warning("LIVENET MODE ENABLED. STUBBED ORDERS ONLY. NO REAL TRADES WILL BE PLACED BY THIS SCRIPT.")
+    if not use_testnet: logger.warning("LIVENET MODE ENABLED. REAL TRADES WILL BE PLACED. EXTREME CAUTION ADVISED.")
 
     if args.setup_api:
         config['bybit_api_key'] = args.bybit_key or input("ByBit Key: ")
@@ -397,10 +552,19 @@ def main():
         rl_agent_inst = QLearningAgent(action_space_n=3) # 3 actions: HOLD, BUY, SELL
         q_path = args.rl_qtable_path or config.get('rl_qtable_path', DEFAULT_RL_Q_TABLE_PATH)
         rl_agent_inst.load_q_table(q_path) # Load Q-table
-        if not rl_agent_inst.q_table and q_path == DEFAULT_RL_Q_TABLE_PATH: # Check if default path was used and it was empty
-             logger.warning(f"RL Q-table at default path '{q_path}' is empty or not found. RL agent will act randomly/learn from scratch if training were enabled.")
-        elif not rl_agent_inst.q_table:
-             logger.warning(f"RL Q-table at '{q_path}' is empty or not found.")
+        if not rl_agent_inst.q_table: # q_table is a defaultdict, so check if it's empty
+            logger.error(f"CRITICAL: RL Q-table at '{q_path}' is empty or could not be loaded. "
+                         f"The RL agent will not function correctly and will make random decisions. "
+                         f"Please ensure the Q-table is generated by training 'rl_agent.py' or 'application.py'.")
+            # Depending on operational requirements, you might want to prevent trading:
+            # if not use_testnet: # Example: prevent live trading with an untrained agent
+            #     logger.critical("EXITING due to empty Q-table in a non-testnet environment.")
+            #     return
+        elif q_path == DEFAULT_RL_Q_TABLE_PATH and len(rl_agent_inst.q_table) < 10: # Arbitrary small number
+             logger.warning(f"RL Q-table at default path '{q_path}' seems very small (entries: {len(rl_agent_inst.q_table)}). "
+                            f"Ensure it's adequately trained.")
+        else:
+             logger.info(f"RL Q-table loaded from '{q_path}' with {len(rl_agent_inst.q_table)} entries.")
 
 
     if args.run_trader:
