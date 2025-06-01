@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from decimal import Decimal
 import csv
 from datetime import datetime
+import os # Added for os.path.exists
 
 from trading_env import TradingEnv # Your custom trading environment
 from rl_agent import QLearningAgent, discretize_state # Your Q-Learning agent
@@ -11,9 +12,15 @@ from rl_agent import QLearningAgent, discretize_state # Your Q-Learning agent
 Q_TABLE_PATH = "q_table.pkl" # Path to the pre-trained Q-table
 INITIAL_USDT_BALANCE = Decimal("1000.0") # Starting balance
 WINDOW_SIZE = 5 # Must match the agent's training window size
-# --- ITERATION POINT: Define how price data is loaded or generated ---
 
-LOG_FILE = "results.csv"
+# --- Constants for Price Data Generation (for this script's context) ---
+PRICE_DATA_LENGTH = 1000  # Length of price data series for training/evaluation
+PRICE_START_PRICE = Decimal("50000.0")  # Initial price for dummy data generation
+PRICE_VOLATILITY = Decimal("0.005")  # Volatility for dummy data generation
+PRICE_DATA_SEED = 42  # Seed for reproducible price data generation
+
+LOG_FILE = "rl_application_results.csv" # Specific log file for this script
+# LIVE_LOG_FILE = "live_trade_log.csv" # This seems redundant if run() logs to LOG_FILE
 
 def run(q_table_path, num_episodes=1):
     """
@@ -86,7 +93,7 @@ def run(q_table_path, num_episodes=1):
             current_episode_portfolio_history.append(info['portfolio_value'])
 
             # Log step details
-            with open(LIVE_LOG_FILE, 'a', newline='') as f:
+            with open(LOG_FILE, 'a', newline='') as f: # Changed LIVE_LOG_FILE to LOG_FILE
                 writer = csv.writer(f)
                 writer.writerow([
                     episode + 1, step_count, datetime.now().isoformat(), action_str, 
@@ -161,8 +168,8 @@ if __name__ == '__main__':
         # to make the _generate_dummy_prices more reproducible if it uses np.random directly
         # without its own internal seeding mechanism.
         np.random.seed(PRICE_DATA_SEED) 
-        run_live(q_table_path=Q_TABLE_PATH, num_episodes=1) # Run for 1 episode for a quick test
+        run(q_table_path=Q_TABLE_PATH, num_episodes=1) # Changed run_live to run
         # For multiple independent live runs with different data, you might vary PRICE_DATA_SEED
         # or preferably load different pre-generated datasets.
         # np.random.seed(PRICE_DATA_SEED + 1) # Example for a second, different run
-        # run_live(q_table_path=Q_TABLE_PATH, num_episodes=5)
+        # run(q_table_path=Q_TABLE_PATH, num_episodes=5) # Changed run_live to run
